@@ -13,6 +13,8 @@ const io = new Server(httpServer, {
 });
 
 const roomStates = {};
+// Track which room and username each socket belongs to
+const socketMeta = {};
 
 function getRoom(id) {
   if (!roomStates[id]) {
@@ -22,9 +24,14 @@ function getRoom(id) {
 }
 
 io.on("connection", (socket) => {
-  socket.on("join-room", (id) => {
+  socket.on("join-room", (id, username) => {
     socket.join(id);
-    io.to(id).emit("playlist-updated", getRoom(id));
+    const room = getRoom(id);
+    if (username) {
+      room.readyUsers[username] = room.readyUsers[username] ?? false;
+      socketMeta[socket.id] = { roomId: id, username };
+    }
+    io.to(id).emit("playlist-updated", room);
   });
 
   socket.on("add-to-playlist", ({ roomId, item }) => {
@@ -65,7 +72,18 @@ io.on("connection", (socket) => {
     io.to(data.roomId).emit("message", data);
   });
 
-  socket.on("disconnect", () => {});
+  socket.on("disconnect", () => {
+    const meta = socketMeta[socket.id];
+    if (meta) {
+      const { roomId, username } = meta;
+      const room = roomStates[roomId];
+      if (room && username) {
+        delete room.readyUsers[username];
+        io.to(roomId).emit("playlist-updated", room);
+      }
+      delete socketMeta[socket.id];
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;
