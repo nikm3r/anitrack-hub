@@ -1,11 +1,6 @@
 import { Server } from "socket.io";
 import { createServer } from "http";
 
-// AniTrack Sync Hub
-// Architecture mirrors Syncplay: server is a dumb relay.
-// All sync logic (seek decisions, slowdown, drift correction) happens on the client.
-// Server just forwards state between room members and tracks who is in which room.
-
 const httpServer = createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200);
@@ -17,44 +12,31 @@ const io = new Server(httpServer, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
 
-// { roomId: { users: { [username]: { position, paused, ts } }, playlist, ... } }
-const rooms = {};
-// { socketId: { roomId, username } }
+const roomStates = {};
 const socketMeta = {};
 
 function getRoom(id) {
-  if (!rooms[id]) {
-    rooms[id] = {
-      playlist: [],
-      currentIndex: 0,
-      readyUsers: {},
-    };
+  if (!roomStates[id]) {
+    roomStates[id] = { playlist: [], currentIndex: 0, readyUsers: {}, host: null };
   }
-  return rooms[id];
+  return roomStates[id];
 }
 
 io.on("connection", (socket) => {
 
-  // ── Join ────────────────────────────────────────────────────────────────────
+  // ─── Room management ──────────────────────────────────────────────────────
 
-  socket.on("join-room", (roomId, username) => {
-    socket.join(roomId);
-    socketMeta[socket.id] = { roomId, username };
-    const room = getRoom(roomId);
-    if (username) room.readyUsers[username] = room.readyUsers[username] ?? false;
-    io.to(roomId).emit("playlist-updated", room);
-    // Notify others
-    socket.to(roomId).emit("message", { sender: "system", text: `${username} joined the room`, system: true });
+  socket.on("join-room", (id, username) => {
+    socket.join(id);
+    const room = getRoom(id);
+    if (username) {
+      room.readyUsers[username] = room.readyUsers[username] ?? false;
+      socketMeta[socket.id] = { roomId: id, username };
+      if (!room.host) room.host = username;
+    }
+    io.to(id).emit("playlist-updated", room);
+    io.to(id).emit("host-changed", { host: room.host });
   });
-
-  // ── State relay (core sync mechanism, mirrors Syncplay protocol) ─────────────
-  // Client sends: { roomId, position, paused, doSeek, ignoringOnTheFly }
-  // Server relays to everyone else in the room — clients decide what to do with it
-  socket.on("state", ({ roomId, position, paused, doSeek, setBy, ignoringOnTheFly }) => {
-    socket.to(roomId).emit("state", { position, paused, doSeek, setBy, ignoringOnTheFly });
-  });
-
-  // ── Playlist events ──────────────────────────────────────────────────────────
 
   socket.on("add-to-playlist", ({ roomId, item }) => {
     const room = getRoom(roomId);
@@ -94,26 +76,33 @@ io.on("connection", (socket) => {
     io.to(data.roomId).emit("message", data);
   });
 
-  // ── Leave / Disconnect ───────────────────────────────────────────────────────
+  // ─── Playback state sync ──────────────────────────────────────────────────
 
-  function userLeft(roomId, username) {
-    const room = rooms[roomId];
-    if (!room || !username) return;
-    delete room.readyUsers[username];
-    io.to(roomId).emit("playlist-updated", room);
-    io.to(roomId).emit("message", { sender: "system", text: `${username} left the room`, system: true });
-  }
-
-  socket.on("leave-room", ({ roomId, username }) => {
-    userLeft(roomId, username);
-    socket.leave(roomId);
-    delete socketMeta[socket.id];
+  socket.on("state", (data) => {
+    const meta = socketMeta[socket.id];
+    if (!meta) return;
+    socket.to(meta.roomId).emit("state", {
+      ...data,
+      ts: Date.now(),
+    });
   });
+
+  // ─── Disconnect ───────────────────────────────────────────────────────────
 
   socket.on("disconnect", () => {
     const meta = socketMeta[socket.id];
     if (meta) {
-      userLeft(meta.roomId, meta.username);
+      const { roomId, username } = meta;
+      const room = roomStates[roomId];
+      if (room && username) {
+        delete room.readyUsers[username];
+        if (room.host === username) {
+          const remaining = Object.keys(room.readyUsers);
+          room.host = remaining.length > 0 ? remaining[0] : null;
+          io.to(roomId).emit("host-changed", { host: room.host });
+        }
+        io.to(roomId).emit("playlist-updated", room);
+      }
       delete socketMeta[socket.id];
     }
   });
@@ -121,5 +110,5 @@ io.on("connection", (socket) => {
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {
-  console.log(`✔ AniTrack Hub running on port ${PORT}`);
+  console.log("AniTrack Hub running on port " + PORT);
 });
