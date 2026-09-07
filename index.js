@@ -1,11 +1,68 @@
 import { Server } from "socket.io";
 import { createServer } from "http";
+import { readFileSync, writeFileSync, existsSync } from "fs";
 
-const httpServer = createServer((req, res) => {
+const SETTINGS_FILE = "./settings-store.json";
+
+function loadStore() {
+  try {
+    if (existsSync(SETTINGS_FILE)) return JSON.parse(readFileSync(SETTINGS_FILE, "utf8"));
+  } catch {}
+  return {};
+}
+
+function saveStore(store) {
+  try { writeFileSync(SETTINGS_FILE, JSON.stringify(store), "utf8"); } catch {}
+}
+
+const settingsStore = loadStore(); // { [username]: { iv, data, updatedAt } }
+
+const httpServer = createServer(async (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
   if (req.url === "/health") {
     res.writeHead(200);
     res.end("ok");
+    return;
   }
+
+  // GET /settings/:username — fetch encrypted blob
+  const getMatch = req.url?.match(/^\/settings\/([^/]+)$/);
+  if (req.method === "GET" && getMatch) {
+    const username = decodeURIComponent(getMatch[1]);
+    const entry = settingsStore[username];
+    if (!entry) { res.writeHead(404); res.end(JSON.stringify({ error: "Not found" })); return; }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(entry));
+    return;
+  }
+
+  // POST /settings/:username — store encrypted blob
+  const postMatch = req.url?.match(/^\/settings\/([^/]+)$/);
+  if (req.method === "POST" && postMatch) {
+    const username = decodeURIComponent(postMatch[1]);
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      try {
+        const { iv, data } = JSON.parse(body);
+        if (!iv || !data) { res.writeHead(400); res.end(JSON.stringify({ error: "iv and data required" })); return; }
+        settingsStore[username] = { iv, data, updatedAt: new Date().toISOString() };
+        saveStore(settingsStore);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch {
+        res.writeHead(400); res.end(JSON.stringify({ error: "Invalid JSON" }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404); res.end("Not found");
 });
 
 const io = new Server(httpServer, {
@@ -23,8 +80,6 @@ function getRoom(id) {
 }
 
 io.on("connection", (socket) => {
-
-  // ─── Room management ──────────────────────────────────────────────────────
 
   socket.on("join-room", (id, username) => {
     socket.join(id);
@@ -76,18 +131,11 @@ io.on("connection", (socket) => {
     io.to(data.roomId).emit("message", data);
   });
 
-  // ─── Playback state sync ──────────────────────────────────────────────────
-
   socket.on("state", (data) => {
     const meta = socketMeta[socket.id];
     if (!meta) return;
-    socket.to(meta.roomId).emit("state", {
-      ...data,
-      ts: Date.now(),
-    });
+    socket.to(meta.roomId).emit("state", { ...data, ts: Date.now() });
   });
-
-  // ─── Disconnect ───────────────────────────────────────────────────────────
 
   socket.on("disconnect", () => {
     const meta = socketMeta[socket.id];
